@@ -96,6 +96,30 @@ function qualificationFor(category: string | null | undefined): string | null {
   return "Qualified"; // Qualified / Interested Not Qualified / Interested Site Visit / Interested in Booking
 }
 
+// Coarse qualified/not-qualified bucket shared by both DreamCRM's own follow-up status
+// vocabulary (Qualified, OV, Interested in Site Visit, In Follow Up, Negotiation, ...) and
+// the lead_category this pipeline extracts from the call itself, so the two can be compared.
+// Funnel stages that aren't clearly one or the other (In Follow Up, Negotiation, Field Visited,
+// Virtually Visited) intentionally bucket to null -- "unclear", not a false mismatch.
+function qualBucket(label: string | null | undefined): "qualified" | "not_qualified" | null {
+  if (!label) return null;
+  const s = String(label).toLowerCase();
+  if (s.includes("not qualified") || s.includes("not interested") || s === "lost") return "not_qualified";
+  if (
+    s.includes("qualified") || s === "ov" || s.includes(" ov") ||
+    s.includes("interested site visit") || s.includes("interested in site visit") ||
+    s.includes("interested in booking") || s.includes("booked")
+  ) return "qualified";
+  return null;
+}
+
+// "match" / "mismatch" / "unclear" -- unclear when either side's status doesn't bucket cleanly.
+function statusMatchFor(crmStatus: string | null | undefined, leadCategory: string | null | undefined): string {
+  const a = qualBucket(crmStatus), b = qualBucket(leadCategory);
+  if (a === null || b === null) return "unclear";
+  return a === b ? "match" : "mismatch";
+}
+
 async function recordFailure(
   db: ReturnType<typeof createClient>,
   base: Record<string, unknown>,
@@ -132,6 +156,7 @@ Deno.serve(async (req: Request) => {
   const businessUnitName = body.business_unit_name ?? null;
   const telephonyCallId = body.telephony_call_id ?? null;
   const duration = Number(body.duration || 0);
+  const crmStatus = body.crm_status ?? null; // DreamCRM's own follow-up status, for the mismatch check
 
   if (!recordingUrl) return j({ error: "missing recording_url" }, 400);
   if (!leadId) return j({ error: "missing lead_id" }, 400);
@@ -146,6 +171,7 @@ Deno.serve(async (req: Request) => {
     recording_url: recordingUrl,
     duration_seconds: duration || null,
     file_name: "call_" + (telephonyCallId || leadId),
+    crm_status: crmStatus,
   };
 
   // ---- fetch the recording into memory only; nothing is ever written to storage ----
@@ -191,6 +217,7 @@ Deno.serve(async (req: Request) => {
       source: "dreamcrm_auto",
       status: isNonTranscribable ? "non_transcribable" : "done",
       qualification: isNonTranscribable ? null : qualificationFor(category),
+      status_match: isNonTranscribable ? "unclear" : statusMatchFor(crmStatus, category),
       non_transcribable_reason: isNonTranscribable ? (parsed.reason || null) : null,
       transcript: isNonTranscribable ? null : (parsed.transcript || null),
       dashboard_fields: parsed.dashboard_fields || null,

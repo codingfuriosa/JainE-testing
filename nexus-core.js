@@ -10710,18 +10710,37 @@ function trAutoStatusTag(r){
   if(r.qualification==='Not Qualified')return '<span class="tag t-red"><i class="fa-solid fa-circle-xmark"></i> '+esc(category||'Not Qualified')+'</span>';
   return '<span class="tag t-gray">—</span>';
 }
+// A row is "today's batch" if it landed today (IST) — since the DreamCRM push runs once a
+// day at midnight IST, everything it ingests this run shares today's date here.
+function trIsTodayIST(r){
+  if(!r.created_at)return false;
+  const d=new Date(new Date(r.created_at).getTime()+5.5*3600*1000);
+  const t=new Date(new Date().getTime()+5.5*3600*1000);
+  return d.getUTCFullYear()===t.getUTCFullYear()&&d.getUTCMonth()===t.getUTCMonth()&&d.getUTCDate()===t.getUTCDate();
+}
+function trMatchTag(r){
+  if(r.status!=='done')return '<span class="tag t-gray">—</span>';
+  if(r.status_match==='mismatch')return '<span class="tag t-red" title="CRM and the transcription disagree on whether this lead is qualified"><i class="fa-solid fa-triangle-exclamation"></i> Mismatch</span>';
+  if(r.status_match==='match')return '<span class="tag t-green"><i class="fa-solid fa-circle-check"></i> Match</span>';
+  return '<span class="tag t-gray">Unclear</span>';
+}
 // "Lost" = pushed from DreamCRM but yielded nothing usable (no real conversation, or the
 // recording itself couldn't be fetched/transcribed) — the KPI the redesign was asked for.
+// "Status Mismatch" is scoped to today's batch — how many calls pushed today have CRM's own
+// follow-up status disagreeing with what the transcription found.
 function trAutoKpisHtml(rows){
+  const today=rows.filter(trIsTodayIST);
   const pushed=rows.length;
   const done=rows.filter(function(r){return r.status==='done';}).length;
   const lost=rows.filter(function(r){return r.status==='non_transcribable'||r.status==='error';}).length;
   const proc=rows.filter(function(r){return r.status==='processing';}).length;
+  const mismatchToday=today.filter(function(r){return r.status_match==='mismatch';}).length;
   return mKpis([
     ['Pushed from DreamCRM',pushed,'previous day, calls > 1 min'],
     ['Transcribed',done,'usable conversation','#16a34a'],
     ['Lost',lost,'no usable recording / no conversation','#dc2626'],
-    ['Processing',proc,proc?'in progress':'all clear',proc?'#d97706':'#16a34a']
+    ['Processing',proc,proc?'in progress':'all clear',proc?'#d97706':'#16a34a'],
+    ['Status Mismatch (Today)',mismatchToday,'CRM vs transcription disagree, today’s batch',mismatchToday?'#dc2626':'#16a34a']
   ]);
 }
 window.trCopyRecording=function(url){
@@ -10735,7 +10754,9 @@ function trAutoRowHtml(r){
     +'<td>'+esc(r.lead_id!=null?String(r.lead_id):'—')+'</td>'
     +'<td>'+trPhoneFmt(r.lead_mobile)+'</td>'
     +'<td>'+esc(r.business_unit_name||'—')+'</td>'
+    +'<td>'+esc(r.crm_status||'—')+'</td>'
     +'<td>'+trAutoStatusTag(r)+'</td>'
+    +'<td>'+trMatchTag(r)+'</td>'
     +'<td>'+trFmtDur(r.duration_seconds)+'</td>'
     +'<td>'+copyBtn+'</td>'
     +'<td>'+openBtn+'</td>'
@@ -10743,7 +10764,7 @@ function trAutoRowHtml(r){
 }
 function trAutoTableHtml(rows){
   if(!rows.length)return '<div class="card" style="margin-top:14px"><div class="empty" style="padding:34px"><i class="fa-solid fa-microphone-lines"></i><div>No calls pushed from DreamCRM yet</div></div></div>';
-  return '<div class="card" style="margin-top:14px"><div style="overflow:auto;max-height:62vh"><table class="tbl"><thead><tr><th>Lead ID</th><th>Lead Mobile</th><th>Project</th><th>Status</th><th>Duration</th><th>Recording</th><th></th></tr></thead><tbody>'
+  return '<div class="card" style="margin-top:14px"><div style="overflow:auto;max-height:62vh"><table class="tbl"><thead><tr><th>Lead ID</th><th>Lead Mobile</th><th>Project</th><th>CRM Status</th><th>Transcription Status</th><th>Match</th><th>Duration</th><th>Recording</th><th></th></tr></thead><tbody>'
     +rows.map(trAutoRowHtml).join('')+'</tbody></table></div></div>';
 }
 

@@ -13,6 +13,10 @@ alter table acc.transcriptions add column if not exists non_transcribable_reason
 alter table acc.transcriptions add column if not exists dashboard_fields jsonb;
 alter table acc.transcriptions add column if not exists qa_evaluation jsonb;
 alter table acc.transcriptions add column if not exists summary_verdict text;
+-- DreamCRM's own follow-up status at the time of the call, and the computed comparison
+-- against what the transcription itself found (lead_category) -- 'match' | 'mismatch' | 'unclear'.
+alter table acc.transcriptions add column if not exists crm_status text;
+alter table acc.transcriptions add column if not exists status_match text;
 
 create index if not exists idx_transcriptions_source on acc.transcriptions(source);
 create index if not exists idx_transcriptions_lead_id on acc.transcriptions(lead_id);

@@ -10686,6 +10686,67 @@ window.trClearDateRange=function(){
   trRenderDateBtn();trRenderList();trRenderFolderRows();
 };
 
+/* ---------- Auto (DreamCRM) tab — calls pushed automatically by DreamCRM's nightly rake
+   task (previous day, connected calls > 1 min). Ingested straight from the recording URL by
+   the transcription-ingest edge function — no file is ever uploaded or stored here, so this
+   tab has no upload/download controls, just a copy button for the source recording URL. ---------- */
+let TR_AUTO_ROWS=null;
+async function trFetchAuto(force){
+  if(TR_AUTO_ROWS&&!force)return TR_AUTO_ROWS;
+  try{
+    const {data,error}=await sb.schema('acc').from('transcriptions').select('*')
+      .eq('source','dreamcrm_auto').is('deleted_at',null).order('created_at',{ascending:false}).limit(2000);
+    if(error)throw error;
+    TR_AUTO_ROWS=data||[];
+  }catch(e){TR_AUTO_ROWS=[];}
+  return TR_AUTO_ROWS;
+}
+function trAutoStatusTag(r){
+  if(r.status==='processing')return '<span class="tag t-amber"><i class="fa-solid fa-spinner fa-spin"></i> Processing</span>';
+  if(r.status==='error')return '<span class="tag t-red"><i class="fa-solid fa-circle-exclamation"></i> Failed</span>';
+  if(r.status==='non_transcribable')return '<span class="tag t-gray" title="'+esc(r.non_transcribable_reason||'')+'"><i class="fa-solid fa-ban"></i> Lost — '+esc(r.non_transcribable_reason||'No conversation')+'</span>';
+  const category=(r.dashboard_fields&&r.dashboard_fields.lead_category)||null;
+  if(r.qualification==='Qualified')return '<span class="tag t-green"><i class="fa-solid fa-circle-check"></i> '+esc(category||'Qualified')+'</span>';
+  if(r.qualification==='Not Qualified')return '<span class="tag t-red"><i class="fa-solid fa-circle-xmark"></i> '+esc(category||'Not Qualified')+'</span>';
+  return '<span class="tag t-gray">—</span>';
+}
+// "Lost" = pushed from DreamCRM but yielded nothing usable (no real conversation, or the
+// recording itself couldn't be fetched/transcribed) — the KPI the redesign was asked for.
+function trAutoKpisHtml(rows){
+  const pushed=rows.length;
+  const done=rows.filter(function(r){return r.status==='done';}).length;
+  const lost=rows.filter(function(r){return r.status==='non_transcribable'||r.status==='error';}).length;
+  const proc=rows.filter(function(r){return r.status==='processing';}).length;
+  return mKpis([
+    ['Pushed from DreamCRM',pushed,'previous day, calls > 1 min'],
+    ['Transcribed',done,'usable conversation','#16a34a'],
+    ['Lost',lost,'no usable recording / no conversation','#dc2626'],
+    ['Processing',proc,proc?'in progress':'all clear',proc?'#d97706':'#16a34a']
+  ]);
+}
+window.trCopyRecording=function(url){
+  if(!url){toast('No recording URL on this call','err');return;}
+  navigator.clipboard.writeText(url).then(function(){toast('Recording URL copied','ok');}).catch(function(){toast('Could not copy — copy it manually','err');});
+};
+function trAutoRowHtml(r){
+  const copyBtn=r.recording_url?('<button class="btn btn-sm" title="Copy recording URL" onclick="trCopyRecording(\''+esc(r.recording_url).replace(/'/g,"\\'")+'\')"><i class="fa-regular fa-copy"></i></button>'):'—';
+  const openBtn=(r.status==='done')?('<button class="btn btn-sm" onclick="navTo(\'transcription/view/'+r.id+'\')">Open</button>'):'—';
+  return '<tr>'
+    +'<td>'+esc(r.lead_id!=null?String(r.lead_id):'—')+'</td>'
+    +'<td>'+trPhoneFmt(r.lead_mobile)+'</td>'
+    +'<td>'+esc(r.business_unit_name||'—')+'</td>'
+    +'<td>'+trAutoStatusTag(r)+'</td>'
+    +'<td>'+trFmtDur(r.duration_seconds)+'</td>'
+    +'<td>'+copyBtn+'</td>'
+    +'<td>'+openBtn+'</td>'
+    +'</tr>';
+}
+function trAutoTableHtml(rows){
+  if(!rows.length)return '<div class="card" style="margin-top:14px"><div class="empty" style="padding:34px"><i class="fa-solid fa-microphone-lines"></i><div>No calls pushed from DreamCRM yet</div></div></div>';
+  return '<div class="card" style="margin-top:14px"><div style="overflow:auto;max-height:62vh"><table class="tbl"><thead><tr><th>Lead ID</th><th>Lead Mobile</th><th>Project</th><th>Status</th><th>Duration</th><th>Recording</th><th></th></tr></thead><tbody>'
+    +rows.map(trAutoRowHtml).join('')+'</tbody></table></div></div>';
+}
+
 /* ==========================================================================================
    ORGANIC — Posts & Reels  (mirrors Business Suite > Content, for our own Pages + Instagram)
    ========================================================================================== */
@@ -11139,9 +11200,16 @@ VIEWS.organic=async function(v,seg){
 VIEWS.transcription=async function(v,seg){
   setCrumb(['Growth & Strategy','Transcription']);
   if(seg[0]==='view'&&seg[1]){return trDetail(v,seg[1]);}
-  const tabs=['All Calls','Folders','Deleted'];
+  const tabs=['All Calls','Folders','Deleted','Auto (DreamCRM)'];
   const ti=mTab(seg,tabs.length);
   const banner='<div class="card card-pad" style="background:#f0fdfa;border-color:#99f6e4;margin:14px 0 16px;font-size:13.5px"><i class="fa-solid fa-language" style="color:#0d9488"></i> Upload a pre-sales call recording — it is transcribed in <b>Hindi, English &amp; Bengali</b> (code-switching aware) and the lead is automatically marked <b>Qualified</b> or <b>Not Qualified</b> against the JainGroup projects, with a reason.</div>';
+  if(ti===3){
+    const rows=await trFetchAuto(true);
+    const autoBanner='<div class="card card-pad" style="background:#eff6ff;border-color:#bfdbfe;margin:14px 0 16px;font-size:13.5px"><i class="fa-solid fa-robot" style="color:#1d4ed8"></i> Pushed automatically every morning by DreamCRM — the previous day\'s connected calls longer than 1 minute. Each recording is fetched, transcribed &amp; analysed on the spot and is never stored here; only the transcript and QA result are kept.</div>';
+    v.innerHTML=mHead('fa-microphone-lines','#0d9488','Transcription')+autoBanner+mTabs('transcription',tabs,ti)
+      +trAutoKpisHtml(rows)+trAutoTableHtml(rows);
+    return;
+  }
   if(ti===2){
     const rows=await trFetchDeleted(true);
     v.innerHTML=mHead('fa-microphone-lines','#0d9488','Transcription')+banner+mTabs('transcription',tabs,ti)

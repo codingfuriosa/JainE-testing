@@ -1,8 +1,14 @@
-// ONE JOB EACH: a SPEECH model turns the audio into words, gpt-4o reads those words.
-// The speech model is gpt-4o-transcribe by default and Gemini on request, so the two can be
-// compared over the same recordings; the judging is gpt-4o either way.
+// TWO ENGINES, TWO SHAPES. ChatGPT stays TWO calls (gpt-4o-transcribe listens, gpt-4o judges the
+// text) - unchanged, and kept specifically as a fallback, see (A) below. Gemini, on a fresh listen,
+// now does BOTH in ONE call (GEMINI_COMBINED_PROMPT) - an explicit, accepted decision to give up the
+// two-call structural protection (B) describes, in exchange for one API round-trip per recording.
+// The local content checks below (degenerateRepeat, the too-thin-for-duration check,
+// name_matches_crm) are what still catch bad output without that structural protection - they are
+// not decoration, they are the safety net now. Re-judging an already-stored transcript (a
+// judge-only retry) still costs one text-only call for either engine - see the `stored` branch in
+// processOne.
 //
-// This exists because of a failure worth recording. The first version asked Gemini, in a single
+// (A) This exists because of a failure worth recording. The first version asked Gemini, in a single
 // call, for a per-turn JSON array with four keys AND six dashboard fields AND six booleans AND seven
 // QA judgements with evidence AND a summary - and it quietly stopped transcribing and started
 // composing. Across 175 calls the name it claimed to hear matched the CRM's own record ZERO times
@@ -16,28 +22,38 @@
 // calls wrongly written off as silence; and demanding verbatim at temperature 0, after which an
 // 8m26s call still came back as 16 turns and named the wrong project. Head to head on Pradip Das's
 // 301 seconds: Gemini 1172 characters, gpt-4o-transcribe 4726, with the real name and real project.
+// (B) That history is exactly why combining Gemini's two calls back into one, now, is a deliberate,
+// flagged decision - not a return to the original untested design. GEMINI_COMBINED_PROMPT carries
+// the same verbatim-first discipline plus an explicit instruction that the judging catalogue must
+// never rewrite the transcript, but a single call still cannot GUARANTEE the separation two
+// independent calls gave for free. Watch gladia_id-tagged rows (which engine produced them) and the
+// name_matches_crm/qa checks accordingly.
 //
-// THE VERBATIM RECORD IS WHAT IS STORED. Stage 2's speaker labels and English are a RENDERING of the
-// stage-1 output, and the raw text is kept in transcript_bn whatever the rendering makes of it.
+// THE VERBATIM RECORD IS WHAT IS STORED. The laid-out speaker labels and English are a RENDERING of
+// it, and the raw text is kept in transcript_bn whatever the rendering makes of it.
 //
 // Nightly Lost-Call QA. Pulls DreamCRM's report - recording_url, lead_id, lead_name,
 // business_unit_name, status, next_follow_up_date, lost_reason and remarks; no call duration, and
 // no lead_mobile any more. Only Lost and In Followup are taken. Then it transcribes and
-// audits each call. The report covers leads being followed up as well as lost ones, so the AI's own
-// verdict (Qualified / Follow-Up / Not Qualified) is checked against the CRM's, and disagreement in
-// either direction is what this exists to surface.
+// audits each call, ONE AT A TIME (CONCURRENCY=1, not in parallel batches). The report covers leads
+// being followed up as well as lost ones, so the AI's own verdict (Qualified / Follow-Up / Not
+// Qualified) is checked against the CRM's, and disagreement in either direction is what this exists
+// to surface.
 //
-// AUDIO IS NEVER STORED: it lives in memory for one API call. We keep the transcript and the ~90 byte
-// link, and re-fetch audio live from Knowlarity. Storing it would be ~4.7 GB/year for no benefit.
+// AUDIO IS NEVER STORED: it lives in memory for one API call (or briefly at Google, via the Gemini
+// Files API, deleted straight after - see geminiUploadFile/geminiDeleteFile). We keep the transcript
+// and the ~90 byte link, and re-fetch audio live from Knowlarity. Storing it would be ~4.7 GB/year
+// for no benefit. The RAW FEED RESPONSE (not audio - CRM metadata only) is the one exception that
+// touches our own storage: one JSON snapshot per day in the transcription-feeds bucket, deleted once
+// that day's pull finishes - see doPull.
 //
 // Actions: pull (queue a day, no AI) / work (process a bounded batch) / run / retry / status.
 // Callers prove themselves via acc.job_secrets, a token the DATABASE generated for itself, which
 // pg_cron reads to build x-sync-secret and this function reads with its service-role key - no human
-// ever invents or pastes a password; or SYNC_SECRET (legacy); or a signed-in user's token.
+// ever invents or pastes a password; or SYNC_SECRET (legacy); or a signed-in user's token, but ONLY
+// MANUAL_TRIGGER_EMAIL's token - every other signed-in user gets a 403, on every action.
 
 import { createClient } from "jsr:@supabase/supabase-js@2";
-// Gemini takes audio as base64 inline data; the speech API takes the bytes directly.
-import { encodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
 type DB = ReturnType<typeof createClient>;
 
 const CORS = {
@@ -50,10 +66,16 @@ const j = (o: unknown, status = 200) =>
 
 /* THE EAR, either one. ChatGPT's speech model is the default on the evidence so far - on Pradip
    Das's 301 second call it returned 4726 characters against Gemini's 1172 - but the two are kept
-   switchable so they can be compared on the same recordings rather than argued about. Only the ear
-   changes: the judging is gpt-4o in both cases. */
+   switchable so they can be compared on the same recordings rather than argued about. `engine`
+   picks BOTH stages together (gpt-4o-transcribe + gpt-4o, or Gemini + Gemini) - never one ear with
+   the other's judge, so a comparison run is a clean A/B rather than a mix. */
 const STT_MODEL = Deno.env.get("STT_MODEL") || "gpt-4o-transcribe";
-const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-flash-latest";
+/* gemini-2.5-pro, not flash: this pipeline feeds the judge stage too now, and the flash model was
+   already the weaker ear in the head-to-head above. Audio goes through the Files API (upload, one
+   generateContent call, delete) rather than inline base64 - the same 20MB request-body ceiling
+   applies either way, but the Files API is what lets a call be re-used across retries without
+   re-encoding, and it is what Google's own docs recommend past a few MB. */
+const GEMINI_MODEL = Deno.env.get("GEMINI_MODEL") || "gemini-2.5-pro";
 
 /* Only these two statuses are taken. The report also sends Qualified, Sit Visited and OV now; they
    are skipped at FETCH time rather than filtered afterwards, so they never reach the queue and never
@@ -105,15 +127,26 @@ function fixSpellings(t: string): string {
    Keeping the two stages apart is deliberate: the transcript is then evidence the judge did not
    produce, so name_matches_crm and crm_status_match stay meaningful checks. */
 const ANALYSIS_MODEL = Deno.env.get("ANALYSIS_MODEL") || "gpt-4o";
+// The Gemini judge, used only when `engine === "gemini"` - see ANALYSIS_MODEL above for the ChatGPT one.
+const GEMINI_ANALYSIS_MODEL = Deno.env.get("GEMINI_ANALYSIS_MODEL") || "gemini-2.5-pro";
 const FEED_URL = Deno.env.get("LOST_CALL_FEED") || "https://www.realtybucket.com/report/lost_call_recordings";
+// A manual (non-cron) request is trusted only from this one account, on every action including
+// "status" - the cron secret path above is a separate, unaffected auth route.
+const MANUAL_TRIGGER_EMAIL = (Deno.env.get("SYNC_MANUAL_EMAIL") || "digitalmarketing@thejaingroup.com").toLowerCase();
 
 const SOURCE = "lost_call_sync";
 const JOB_SECRET_NAME = "transcription_sync";
+// A private Storage bucket, one raw feed snapshot per day, deleted again once that day's pull has
+// finished being written into acc.transcriptions - an audit copy of exactly what the CRM sent,
+// there only for the lifetime of the pull that used it. See doPull.
+const FEED_SNAPSHOT_BUCKET = "transcription-feeds";
 const MIN_DURATION_SECONDS = 60;
 const MAX_AUDIO_BYTES = 20 * 1024 * 1024;
-/* Three recordings at once, each costing two API calls. Transcription of a five minute call takes
-   seconds, so one round per invocation stays comfortably inside the wall clock. */
-const CONCURRENCY = 3;
+/* One recording at a time, deliberately sequential rather than run in parallel batches. Was 3;
+   changed on request, and it also suits the combined Gemini call better - one big multimodal
+   request per call is heavier than the old plain-text-out stage 1, so overlapping several of them
+   bought nothing but a bigger chance of hitting the platform's own per-invocation time limit. */
+const CONCURRENCY = 1;
 /* Automatic retry. An error is usually transient; an empty transcript is a failure to hear rather
    than a fact about the recording, which is why it is retried too - 17 calls once written off as
    silence turned out to hold conversations. Bounded at three so a genuinely empty file stops costing
@@ -141,35 +174,6 @@ anything the transcript does not contain):
 - Dream Exotica: 2BHK 36 lakh, 3BHK 44 lakh. READY TO MOVE. Madhyamgram, Badu Road.
 - Dream One: Rajarhat, opposite Eco Park.
 - Dream Residency Manor.`;
-
-/* Gemini needs telling what a speech model knows by construction: transcribe, do not summarise,
-   and do not stop early. Every instruction here exists because its absence produced a specific
-   failure - an 8m26s call returned as 16 turns, a call written off as "silence" that had people
-   talking in it, and the project catalogue recited back as the conversation. Deliberately NO
-   catalogue here: given the list, it read the list out. */
-const GEMINI_TRANSCRIBE_PROMPT = `You are a transcriptionist. This is a Jain Group (Kolkata
-real-estate) sales call - a compressed 8 kHz telephone recording, speech mixing Bengali, Hindi and
-English.
-
-WRITE DOWN EVERY WORD SPOKEN. Not a summary. Not the gist. Every word.
-
-- Transcribe the WHOLE recording, first sound to last. Never stop early, never write "conversation
-  continues". Eight minutes of audio means dozens of turns.
-- VERBATIM: keep every "hello", "haan", "achha", "ji", every repetition and false start. Do not tidy,
-  merge or shorten.
-- There is ALMOST ALWAYS speech. Ringing, a caller tune or an IVR message at the start is normal and
-  is NEVER a reason to stop - skip past it and transcribe what follows. Do not call a recording empty
-  because it opens with ringing, is noisy, or the voices are faint.
-- Where you truly cannot make out a phrase, write [inaudible] in its place and carry on. That is for
-  gaps, never for a whole call.
-- NEVER invent a name, a figure, a location or a project you did not hear.
-
-Kolkata place names are said in Bengali and written differently: Pailan (heard as "Poylan"), Joka,
-Madhyamgram, Doltala, Rajarhat, Barasat, Narendrapur, Chinar Park. The developer is "Jain Group" -
-"Gems Group" or "Jems Group" is a mishearing.
-
-Output the conversation as plain text, one turn per line, each line starting "Agent:" or "Customer:".
-Nothing else - no preamble, no JSON, no commentary.`;
 
 const STT_HINT = "Jain Group real-estate sales call, Kolkata. Projects: Dream World City, Dream "
   + "Gurukul, Dream Exotica, Dream Valley, Dream Eco City, Dream One, Dream Residency Manor. Areas: "
@@ -216,10 +220,11 @@ SECOND, judge the call, using ONLY what the transcript contains:
   "project_discussed": as above
 }
 
-"criteria": six booleans, true ONLY where the transcript establishes it:
+"criteria": seven booleans, true ONLY where the transcript establishes it:
   "site_visit_interested" - the customer agreed to a site visit or asked for one
   "location_match"        - the location they want is one JainGroup builds in
   "bhk_match"             - the configuration they want is available
+  "sqft_match"            - the carpet/super built-up area they want matches what the project offers
   "budget_match"          - their budget fits the project discussed
   "ready_move_match"      - ready-to-move vs under-construction matches what was offered
   "follow_up_requested"   - they did not decide but asked to be contacted again ("call me later",
@@ -237,6 +242,101 @@ agreed, and what the agent should have done differently. If the call was only a 
 plainly instead of padding it out.
 
 If a message below the transcript gives the CRM's own record for this call (a lost reason and/or
+remarks the sales agent typed in), also return:
+"discrepancy_check": {
+  "lost_reason_match": true if the CRM's stated lost reason and your own dashboard_fields.lost_reason
+    refer to the same underlying issue, false if they clearly differ, null if the CRM gave no reason,
+  "lost_reason_note": one short sentence on the comparison, "" if null,
+  "remarks_match": true if the CRM's remarks and your summary_verdict describe the same gist/outcome,
+    false if they substantially disagree, null if the CRM gave no remarks,
+  "remarks_note": one short sentence on the comparison, "" if null
+}
+Judge these on substance, not wording - a CRM code like "LOCATION NOT SUITABLE" matches a summary
+that says the customer wanted a different area, even though the words differ.`;
+
+/* THE COMBINED PROMPT, for the single-call Gemini flow only (engine==="gemini", a fresh listen -
+   never for re-judging an already-stored transcript, which still uses the plain ANALYSE_PROMPT
+   above against text alone). Step 1 carries the same transcribe-verbatim discipline the old
+   stage-1-only prompt used; step 2 borrows ANALYSE_PROMPT's judging contract verbatim. The one addition, over and above
+   concatenating the two, is the paragraph telling the model the catalogue in step 2 must never
+   rewrite what it already wrote in step 1 - because giving up the "two independent calls"
+   structural protection (see the top-of-file note: 0/20 correct names out of 175 calls, on the
+   FIRST version of this exact idea) means this prompt is now the ONLY thing standing between
+   "genuinely listened" and "composed something plausible". It is not a substitute for the local
+   content checks below (degenerateRepeat, the too-thin check, name_matches_crm) - those still run
+   against whatever comes back here, and are the actual safety net now. */
+const GEMINI_COMBINED_PROMPT = `You are doing two jobs, in order, on one recording of a Jain Group
+(Kolkata real-estate) sales call - a compressed 8 kHz telephone recording, speech mixing Bengali,
+Hindi and English. Do STEP 1 completely, as if it were your only task, before starting STEP 2.
+
+STEP 1 - LISTEN. Produce a verbatim transcript of the WHOLE recording, first sound to last.
+- WRITE DOWN EVERY WORD SPOKEN. Not a summary, not the gist. Every "hello", "haan", "achha", "ji",
+  every repetition and false start. Do not tidy, merge or shorten.
+- Never stop early and never write "conversation continues" - eight minutes of audio means dozens
+  of turns.
+- There is ALMOST ALWAYS speech. Ringing, a caller tune or an IVR message at the start is normal
+  and is NEVER a reason to stop - skip past it and transcribe what follows. Do not call a recording
+  empty because it opens with ringing, is noisy, or the voices are faint.
+- Where you truly cannot make out a phrase, write [inaudible] in its place and carry on. That is
+  for gaps, never for a whole call.
+- Kolkata place names are said in Bengali and written differently: Pailan (heard as "Poylan"),
+  Joka, Madhyamgram, Doltala, Rajarhat, Barasat, Narendrapur, Chinar Park. The developer is "Jain
+  Group" - "Gems Group" or "Jems Group" is a mishearing.
+- NEVER invent a name, a figure, a location or a project you did not actually hear on THIS call.
+  STEP 2 below, including the project catalogue, is reference material for judging what you heard -
+  it is not something you heard, and reading it must not change one word of what you write here. If
+  the catalogue's figures or project names do not appear in the audio, they do not belong in your
+  transcript, no matter how plausible they would sound.
+
+STEP 2 - JUDGE, using ONLY what you actually transcribed in STEP 1:
+
+${CATALOGUE}
+
+Reply with a single json object and nothing else - the keys are listed below. It has no speaker
+labels of its own; you are producing them.
+
+FIRST, lay the conversation out from STEP 1:
+- "transcript_original": every turn as spoken, in the original words, each line starting "Agent:"
+  or "Customer:". KEEP EVERY WORD - this is your STEP 1 transcript, not a rewritten version of it.
+  If you cannot tell who spoke a line, label it "Speaker:" rather than guessing.
+- "transcript_english": the SAME turns, same count, same order, translated to natural English.
+
+SECOND, judge the call, using ONLY what the transcript above contains:
+
+"customer_name": the customer's name ONLY if it is actually spoken in the transcript, else ""
+"project_discussed": the project actually named in the transcript, else "Unclear"
+"languages": which of Hindi, Bengali, English actually appear
+
+"dashboard_fields": {
+  "number_asked": "Yes" or "No" - did the agent ask for or confirm a contact number,
+  "pincode_provided": the pincode if one was given, else "None",
+  "lead_category": EXACTLY one of 'Not Interested','Qualified','Interested Not Qualified','Interested Site Visit','Interested in Booking',
+  "lost_reason": why this lead did not progress, or "None",
+  "project_discussed": as above
+}
+
+"criteria": seven booleans, true ONLY where the transcript establishes it:
+  "site_visit_interested" - the customer agreed to a site visit or asked for one
+  "location_match"        - the location they want is one JainGroup builds in
+  "bhk_match"             - the configuration they want is available
+  "sqft_match"            - the carpet/super built-up area they want matches what the project offers
+  "budget_match"          - their budget fits the project discussed
+  "ready_move_match"      - ready-to-move vs under-construction matches what was offered
+  "follow_up_requested"   - they did not decide but asked to be contacted again ("call me later",
+                            "I am busy", "call me next week"), or a callback time was agreed. FALSE if
+                            they said they have no requirement, have already bought, or are simply
+                            not interested - that is a closed lead, not a pending one.
+
+"qa_evaluation": seven objects, each {"point","status","evidence","notes"}, status "Pass", "Fail" or
+"Partial". The points are Script, Etiquette, Query Handling, Call to Action, Leakage Avoidance,
+Follow-up Accuracy, Hyper-personalization. If something never arose because the customer ended the
+call early, say so in notes rather than failing the agent for it.
+
+"summary_verdict": several sentences - what the customer wanted, how the agent handled it, what was
+agreed, and what the agent should have done differently. If the call was only a few words, say that
+plainly instead of padding it out.
+
+If a message below this prompt gives the CRM's own record for this call (a lost reason and/or
 remarks the sales agent typed in), also return:
 "discrepancy_check": {
   "lost_reason_match": true if the CRM's stated lost reason and your own dashboard_fields.lost_reason
@@ -394,7 +494,7 @@ function judgeMismatch(crmStatus: string | null, category: string | null) {
    and the badge cannot disagree. Three outcomes, not two: a customer who asked to be called back has
    neither matched nor been lost, and forcing them into Not Qualified is how a live lead gets written
    off. Order matters - a firm yes outranks a maybe, and a maybe outranks nothing. */
-const CRIT_KEYS = ["site_visit_interested","location_match","bhk_match","budget_match","ready_move_match","follow_up_requested"];
+const CRIT_KEYS = ["site_visit_interested","location_match","bhk_match","sqft_match","budget_match","ready_move_match","follow_up_requested"];
 function normaliseCriteria(v: unknown): Record<string, boolean> | null {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   const out: Record<string, boolean> = {};
@@ -406,14 +506,14 @@ function qualifyFrom(c: Record<string, boolean> | null) {
   if (c.site_visit_interested) {
     return { qualification: "Qualified", why: "The customer agreed to a site visit." };
   }
-  if (c.location_match && c.bhk_match && c.budget_match && c.ready_move_match) {
-    return { qualification: "Qualified", why: "Location, configuration, budget and possession timeline all match." };
+  if (c.location_match && c.bhk_match && c.sqft_match && c.budget_match && c.ready_move_match) {
+    return { qualification: "Qualified", why: "Location, configuration, square footage, budget and possession timeline all match." };
   }
   if (c.follow_up_requested) {
     return { qualification: "Follow-Up",
       why: "The customer did not decide on this call but asked to be contacted again - still open, not lost." };
   }
-  const missing = ([["location_match","location"],["bhk_match","configuration"],
+  const missing = ([["location_match","location"],["bhk_match","configuration"],["sqft_match","square footage"],
                     ["budget_match","budget"],["ready_move_match","possession timeline"]] as const)
     .filter(([k]) => !c[k]).map(([, label]) => label);
   return {
@@ -483,6 +583,19 @@ async function doPull(db: DB, from: string, to: string, trigger: string) {
     return j({ error: "feed fetch failed: " + error_text }, 502);
   }
 
+  /* Daily audit snapshot: the RAW feed response, exactly as the CRM returned it, before any status
+     filtering. Non-fatal - a snapshot failing to upload must never stop the pull itself; it is an
+     audit aid, not a dependency of anything downstream. Deleted again in the `finally` below once
+     this day's pull has finished being written into acc.transcriptions. */
+  const snapshotPath = `${from}.json`;
+  const { error: snapErr } = await db.storage.from(FEED_SNAPSHOT_BUCKET).upload(
+    snapshotPath,
+    new Blob([JSON.stringify(feed)], { type: "application/json" }),
+    { contentType: "application/json", upsert: true },
+  );
+  if (snapErr) console.error(`transcription-feeds snapshot upload failed for ${from}: ${snapErr.message}`);
+
+  try {
   // The feed repeats rows, and sends exact duplicates when recording_url is "None". Dedupe so the
   // no-recording rows collapse to one per lead rather than inflating "calls received".
   const seen = new Set<string>();
@@ -580,12 +693,96 @@ async function doPull(db: DB, from: string, to: string, trigger: string) {
   return { from, to, feed_rows: feed.length, unique_calls: queued.length, inserted,
            duplicates: queued.length - fresh.length, no_recording: noRecording,
            skipped_other_statuses: skippedStatus };
+  } finally {
+    // Best-effort: a leftover file is not a correctness problem (tomorrow's pull upserts over it,
+    // and it's a private bucket nobody else can reach), but the design intent is that it's gone
+    // once this day is done being processed.
+    const { error: delErr } = await db.storage.from(FEED_SNAPSHOT_BUCKET).remove([snapshotPath]);
+    if (delErr) console.error(`transcription-feeds snapshot cleanup failed for ${from}: ${delErr.message}`);
+  }
+}
+
+/* Upload one recording to Gemini's Files API, ahead of the transcribe call that references it by
+   file_uri. Multipart, hand-built rather than pulled in as a dependency for one request: a JSON
+   metadata part naming the file, then the raw audio bytes under the real mime type Knowlarity
+   served (never "octet-stream" - see the note on `mimeType` above `processOne`). */
+async function geminiUploadFile(geminiKey: string, audio: Uint8Array, mimeType: string, displayName: string) {
+  const boundary = "jaingroup_" + Date.now().toString(36) + Math.random().toString(36).slice(2);
+  const enc = new TextEncoder();
+  const head = enc.encode(
+    `--${boundary}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n`
+    + JSON.stringify({ file: { displayName } }) + `\r\n`
+    + `--${boundary}\r\nContent-Type: ${mimeType}\r\n\r\n`);
+  const tail = enc.encode(`\r\n--${boundary}--`);
+  const body = new Uint8Array(head.length + audio.length + tail.length);
+  body.set(head, 0); body.set(audio, head.length); body.set(tail, head.length + audio.length);
+
+  const res = await fetch(`https://generativelanguage.googleapis.com/upload/v1beta/files?key=${geminiKey}`, {
+    method: "POST",
+    headers: { "X-Goog-Upload-Protocol": "multipart", "Content-Type": `multipart/related; boundary=${boundary}` },
+    body,
+  });
+  const gj = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(`Gemini file upload failed (${res.status}): ${JSON.stringify(gj).slice(0, 300)}`);
+  const name = gj?.file?.name, uri = gj?.file?.uri;
+  if (!name || !uri) throw new Error("Gemini file upload returned no name/uri");
+  return { name, uri } as { name: string; uri: string };
+}
+
+/* AUDIO IS NEVER STORED is the design rule for this pipeline (see the top-of-file note) - the Files
+   API is the one place audio touches disk at all, and only for the single request that needs it.
+   Best-effort and never thrown: a failed delete must not fail the call it already transcribed, and
+   Google auto-expires anything left behind after 48 hours regardless. */
+async function geminiDeleteFile(geminiKey: string, name: string): Promise<void> {
+  try { await fetch(`https://generativelanguage.googleapis.com/v1beta/${name}?key=${geminiKey}`, { method: "DELETE" }); }
+  catch { /* 48h auto-expiry is the backstop */ }
+}
+
+/* THE COMBINED CALL - one Gemini request that transcribes AND judges together, for a FRESH listen
+   only (never for re-judging an already-stored transcript - see the `stored` branch in processOne,
+   which still uses the old text-only judge call, because that path was never the risky one).
+   Reuses geminiUploadFile/geminiDeleteFile unchanged; the only difference from a plain transcribe
+   call is the prompt (GEMINI_COMBINED_PROMPT, which also carries the judging contract), the CRM context
+   appended to it, and response_mime_type: "application/json" so this one call returns the full
+   judged JSON instead of plain transcript text. */
+async function geminiTranscribeAndJudge(geminiKey: string, audio: Uint8Array, mimeType: string,
+                                        displayName: string, geminiModel: string, crmContext: string) {
+  const uploaded = await geminiUploadFile(geminiKey, audio, mimeType, displayName);
+  try {
+    const gr = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${geminiKey}`,
+      { method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [
+            { text: GEMINI_COMBINED_PROMPT + crmContext },
+            { file_data: { mime_type: mimeType, file_uri: uploaded.uri } }] }],
+          generationConfig: { temperature: 0, maxOutputTokens: 60000, response_mime_type: "application/json" },
+        }) });
+    const gj = await gr.json().catch(() => ({}));
+    if (!gr.ok) throw new Error(`Gemini failed (${gr.status}): ${JSON.stringify(gj).slice(0,300)}`);
+    const raw = gj?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+    if (!raw) {
+      const why = gj?.candidates?.[0]?.finishReason;
+      throw new Error(why ? `Gemini returned no text (finishReason: ${why})` : "Gemini returned nothing");
+    }
+    try {
+      return JSON.parse(raw);
+    } catch (pe) {
+      const cutOff = gj?.candidates?.[0]?.finishReason === "MAX_TOKENS";
+      throw new Error(cutOff
+        ? "combined transcribe+analyse reply was cut off (hit the 60000 token cap) before the JSON closed"
+        : `could not parse the combined reply as JSON: ${String((pe as any)?.message || pe)}`);
+    }
+  } finally {
+    await geminiDeleteFile(geminiKey, uploaded.name);
+  }
 }
 
 // ---------------------------------------------------------------- WORK
 async function processOne(db: DB, row: any, openaiKey: string,
                           sttModel = STT_MODEL, analysisModel = ANALYSIS_MODEL,
-                          engine = "chatgpt", geminiKey = "", geminiModel = GEMINI_MODEL) {
+                          engine = "chatgpt", geminiKey = "", geminiModel = GEMINI_MODEL,
+                          geminiAnalysisModel = GEMINI_ANALYSIS_MODEL) {
   // Counted here rather than at the end, so an attempt that crashes still counts against the cap.
   const attempts = Number(row.attempts || 0) + 1;
   const checks: Check[] = [{ check: "recording_present", status: "pass", detail: "CRM feed supplied a recording URL." }];
@@ -650,31 +847,31 @@ async function processOne(db: DB, row: any, openaiKey: string,
       detail: `Reusing the transcript already stored for this call (${stored.length} characters) - only the analysis is being redone.` });
   }
 
-  /* STAGE 1 - the listening, by whichever engine was asked for. Everything after this point is
-     identical either way, which is the only way a comparison between the two means anything: the
-     judging is gpt-4o regardless, so a difference in the result is a difference in the ear. */
+  /* Computed here, before Stage 1, because the combined Gemini call needs it in the SAME request as
+     the audio - it used to only need to exist before Stage 2. */
+  const crmContext = (row.crm_lost_reason || row.crm_remarks)
+    ? "\n\nCRM'S OWN RECORD FOR THIS CALL (compare your findings against this, do not treat it as fact "
+      + "about what was said on the call):\n"
+      + `- Lost reason on file: ${row.crm_lost_reason || "(none given)"}\n`
+      + `- Remarks on file: ${row.crm_remarks || "(none given)"}\n`
+    : "";
+
+  /* STAGE 1 - the listening, by whichever engine was asked for. A fresh Gemini listen also does the
+     JUDGING in the same call (parsed gets set here, not in Stage 2 below) - see the top-of-file note
+     and GEMINI_COMBINED_PROMPT for why, and processOne's `if (!parsed)` guard further down for how
+     Stage 2 is skipped when this already happened. ChatGPT stays two calls, unchanged. */
   let spoken = stored;
+  let parsed: any;
   if (!stored) {
     try {
       if (engine === "gemini") {
         if (!geminiKey) throw new Error("GEMINI_API_KEY is not configured");
-        const gr = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${geminiModel}:generateContent?key=${geminiKey}`,
-          { method: "POST", headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              contents: [{ parts: [
-                { text: GEMINI_TRANSCRIBE_PROMPT },
-                { inline_data: { mime_type: mimeType, data: encodeBase64(audio) } }] }],
-              // Plain text out, no schema: one job, and a schema to fill is an invitation to invent.
-              generationConfig: { temperature: 0, maxOutputTokens: 60000 },
-            }) });
-        const gj = await gr.json().catch(() => ({}));
-        if (!gr.ok) throw new Error(`Gemini failed (${gr.status}): ${JSON.stringify(gj).slice(0,300)}`);
-        spoken = String(gj?.candidates?.[0]?.content?.parts?.[0]?.text || "").trim();
-        if (!spoken) {
-          const why = gj?.candidates?.[0]?.finishReason;
-          throw new Error(why ? `Gemini returned no text (finishReason: ${why})` : "Gemini returned nothing");
-        }
+        // Files API: upload once, reference by uri, delete straight after - see geminiUploadFile/
+        // geminiDeleteFile above. The delete runs even if the call below throws.
+        const displayName = `${String(row.file_name || row.title || "call").slice(0, 150)}.mp3`;
+        parsed = await geminiTranscribeAndJudge(geminiKey, audio, mimeType, displayName, geminiModel, crmContext);
+        spoken = String(parsed?.transcript_original || "").trim();
+        if (!spoken) throw new Error("Gemini's combined call returned no transcript_original");
       } else {
         if (!openaiKey) throw new Error("CHATGPT_API_KEY is not configured");
         /* The file MUST carry a name with an extension: OpenAI picks its decoder from that, and an
@@ -756,47 +953,70 @@ async function processOne(db: DB, row: any, openaiKey: string,
       + (density !== null ? ` (${Math.round(density*10)/10} per second)` : "")
       + `, in line with a real transcript.` });
 
-  /* STAGE 2 - lay it out and judge it. The CRM's own record (if it sent one) rides along in the SAME
-     call rather than a separate one - the model already has the transcript in front of it, so asking
-     it to also compare against the CRM's lost reason/remarks costs nothing extra. */
-  const crmContext = (row.crm_lost_reason || row.crm_remarks)
-    ? "\n\nCRM'S OWN RECORD FOR THIS CALL (compare your findings against this, do not treat it as fact "
-      + "about what was said on the call):\n"
-      + `- Lost reason on file: ${row.crm_lost_reason || "(none given)"}\n`
-      + `- Remarks on file: ${row.crm_remarks || "(none given)"}\n`
-    : "";
-  let parsed: any;
+  /* STAGE 2 - lay it out and judge it. Skipped entirely when `parsed` is already set - a fresh
+     Gemini listen did this in the SAME call as Stage 1 (see above); this block only runs for a
+     ChatGPT fresh listen, or for EITHER engine re-judging an already-`stored` transcript (text
+     only, cheaper than a full re-listen). The CRM's own record (if it sent one) rides along in the
+     SAME call rather than a separate one - the model already has the transcript in front of it, so
+     asking it to also compare against the CRM's lost reason/remarks costs nothing extra. */
+  if (!parsed) {
   try {
-    if (!openaiKey) throw new Error("CHATGPT_API_KEY is not configured");
-    const ar = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: "Bearer " + openaiKey },
-      body: JSON.stringify({
-        model: analysisModel,
-        temperature: 0,
-        response_format: { type: "json_object" },
-        // The reply duplicates the transcript twice over (original + English) plus everything
-        // else, so a long call's JSON can run long. Left unset, a handful of calls a night came
-        // back with the closing quote missing mid-string - the model just ran out of budget.
-        max_tokens: 16000,
-        messages: [
-          { role: "system", content: ANALYSE_PROMPT },
-          { role: "user", content: "VERBATIM TRANSCRIPT:\n\n" + verbatim + crmContext },
-        ],
-      }) });
-    const aj = await ar.json().catch(() => ({}));
-    if (!ar.ok) throw new Error(`analysis failed (${ar.status}): ${JSON.stringify(aj).slice(0,300)}`);
-    const raw = aj?.choices?.[0]?.message?.content || "";
-    if (!raw) throw new Error("the analysis returned nothing");
-    try {
-      parsed = JSON.parse(raw);
-    } catch (pe) {
-      // A cut-off JSON string (missing closing quote/brace) means the model hit its output cap
-      // mid-reply, not a genuinely malformed response - worth telling apart from other parse bugs.
-      const cutOff = aj?.choices?.[0]?.finish_reason === "length";
-      throw new Error(cutOff
-        ? `analysis reply was cut off (hit the ${16000} token cap) before the JSON closed`
-        : `could not parse the analysis reply as JSON: ${String((pe as any)?.message || pe)}`);
+    if (engine === "gemini") {
+      // Text only - no audio, no file_uri. Same discipline as the ChatGPT judge: the model reads
+      // the transcript exactly like a person would, not the recording.
+      if (!geminiKey) throw new Error("GEMINI_API_KEY is not configured");
+      const ar = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/${geminiAnalysisModel}:generateContent?key=${geminiKey}`,
+        { method: "POST", headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [{ parts: [
+              { text: ANALYSE_PROMPT + "\n\nVERBATIM TRANSCRIPT:\n\n" + verbatim + crmContext } ] }],
+            generationConfig: { temperature: 0, maxOutputTokens: 16000, response_mime_type: "application/json" },
+          }) });
+      const aj = await ar.json().catch(() => ({}));
+      if (!ar.ok) throw new Error(`analysis failed (${ar.status}): ${JSON.stringify(aj).slice(0,300)}`);
+      const raw = aj?.candidates?.[0]?.content?.parts?.[0]?.text || "";
+      if (!raw) throw new Error("the analysis returned nothing");
+      try {
+        parsed = JSON.parse(raw);
+      } catch (pe) {
+        const cutOff = aj?.candidates?.[0]?.finishReason === "MAX_TOKENS";
+        throw new Error(cutOff
+          ? `analysis reply was cut off (hit the ${16000} token cap) before the JSON closed`
+          : `could not parse the analysis reply as JSON: ${String((pe as any)?.message || pe)}`);
+      }
+    } else {
+      if (!openaiKey) throw new Error("CHATGPT_API_KEY is not configured");
+      const ar = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: "Bearer " + openaiKey },
+        body: JSON.stringify({
+          model: analysisModel,
+          temperature: 0,
+          response_format: { type: "json_object" },
+          // The reply duplicates the transcript twice over (original + English) plus everything
+          // else, so a long call's JSON can run long. Left unset, a handful of calls a night came
+          // back with the closing quote missing mid-string - the model just ran out of budget.
+          max_tokens: 16000,
+          messages: [
+            { role: "system", content: ANALYSE_PROMPT },
+            { role: "user", content: "VERBATIM TRANSCRIPT:\n\n" + verbatim + crmContext },
+          ],
+        }) });
+      const aj = await ar.json().catch(() => ({}));
+      if (!ar.ok) throw new Error(`analysis failed (${ar.status}): ${JSON.stringify(aj).slice(0,300)}`);
+      const raw = aj?.choices?.[0]?.message?.content || "";
+      if (!raw) throw new Error("the analysis returned nothing");
+      try {
+        parsed = JSON.parse(raw);
+      } catch (pe) {
+        // A cut-off JSON string (missing closing quote/brace) means the model hit its output cap
+        // mid-reply, not a genuinely malformed response - worth telling apart from other parse bugs.
+        const cutOff = aj?.choices?.[0]?.finish_reason === "length";
+        throw new Error(cutOff
+          ? `analysis reply was cut off (hit the ${16000} token cap) before the JSON closed`
+          : `could not parse the analysis reply as JSON: ${String((pe as any)?.message || pe)}`);
+      }
     }
   } catch (e) {
     /* The transcript is the expensive part and it is already in hand, so it is SAVED even when the
@@ -807,8 +1027,19 @@ async function processOne(db: DB, row: any, openaiKey: string,
       duration_seconds: seconds, transcript: verbatim, transcript_bn: verbatim, gladia_id: engine,
     });
   }
+  }
 
-  const turns = parseTurns(String(parsed?.transcript_english || ""), String(parsed?.transcript_original || ""));
+  /* Same IVR-strip/spelling-fix cleanup `verbatim` already got, applied here too. For a ChatGPT
+     judge (or a re-judge of an already-cleaned `stored` transcript) the judge only ever SAW the
+     cleaned verbatim text, so its own turns were already clean by construction. A fresh Gemini
+     combined call is different: the model listened to the RAW audio directly, so its
+     transcript_original/transcript_english need the same cleanup applied here, or the switchboard
+     greeting and Bengali mis-hearings would show up in the rendered turns even though `verbatim`
+     (and therefore transcript_bn) is clean. Both helpers are plain string-in-string-out regexes, so
+     applying them again on already-clean text is a safe no-op. */
+  const turns = parseTurns(
+    fixSpellings(stripIvr(String(parsed?.transcript_english || ""))),
+    fixSpellings(stripIvr(String(parsed?.transcript_original || ""))));
   const transcriptEn = turns.length ? flattenTurns(turns, "text") : verbatim;
   // The original-language column keeps the raw speech-to-text output, not a re-rendering of it.
   const transcriptBn = verbatim;
@@ -1017,9 +1248,10 @@ async function promoteRetries(db: DB) {
 
 async function doWork(db: DB, limit: number, openaiKey: string,
                       sttModel = STT_MODEL, analysisModel = ANALYSIS_MODEL,
-                      engine = "chatgpt", geminiKey = "", geminiModel = GEMINI_MODEL) {
+                      engine = "chatgpt", geminiKey = "", geminiModel = GEMINI_MODEL,
+                      geminiAnalysisModel = GEMINI_ANALYSIS_MODEL) {
   const retried = await promoteRetries(db);
-  const cols = "id, lead_id, recording_url, crm_status, report_date, business_unit_name, customer_name, attempts, transcript, crm_lost_reason, crm_remarks, next_follow_up_date";
+  const cols = "id, lead_id, recording_url, crm_status, report_date, business_unit_name, customer_name, attempts, transcript, crm_lost_reason, crm_remarks, next_follow_up_date, file_name";
   const { data: queue, error } = await db.schema("acc").from("transcriptions").select(cols)
     .eq("source", SOURCE).eq("status", "queued").is("deleted_at", null)
     .order("id", { ascending: true }).limit(limit);
@@ -1035,14 +1267,15 @@ async function doWork(db: DB, limit: number, openaiKey: string,
   const results: unknown[] = [];
   for (let i = 0; i < mine.length; i += CONCURRENCY) {
     results.push(...await Promise.all(mine.slice(i, i + CONCURRENCY).map((r) =>
-      processOne(db, r, openaiKey, sttModel, analysisModel, engine, geminiKey, geminiModel).catch((e) => ({
+      processOne(db, r, openaiKey, sttModel, analysisModel, engine, geminiKey, geminiModel, geminiAnalysisModel).catch((e) => ({
         id: r.id, lead_id: r.lead_id, status: "error", error: String((e as any)?.message || e) })))));
   }
   const { count } = await db.schema("acc").from("transcriptions")
     .select("id", { count: "exact", head: true })
     .eq("source", SOURCE).eq("status", "queued").is("deleted_at", null);
-  return { processed: results.length, remaining: count ?? 0, retried,
-           engine, transcriber: engine === "gemini" ? geminiModel : sttModel, analysisModel, results };
+  return { processed: results.length, remaining: count ?? 0, retried, engine,
+           transcriber: engine === "gemini" ? geminiModel : sttModel,
+           analyst: engine === "gemini" ? geminiAnalysisModel : analysisModel, results };
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -1075,10 +1308,15 @@ Deno.serve(async (req: Request) => {
     const asUser = createClient(SB, Deno.env.get("SUPABASE_ANON_KEY") || SRV, {
       global: { headers: { Authorization: "Bearer " + bearer } } });
     const { data } = await asUser.auth.getUser();
-    authorized = !!data?.user;
+    const userEmail = String(data?.user?.email || "").toLowerCase();
+    if (data?.user && userEmail === MANUAL_TRIGGER_EMAIL) {
+      authorized = true;
+    } else if (data?.user) {
+      // A genuinely signed-in user - just not the one account allowed to trigger this by hand.
+      return j({ error: `manual triggering of transcription-sync is restricted to ${MANUAL_TRIGGER_EMAIL}` }, 403);
+    }
   }
   if (!authorized) return j({ error: "unauthorized" }, 401);
-  if (!OPENAI_KEY) return j({ error: "CHATGPT_API_KEY not configured in Secrets" }, 500);
 
   let body: any = {};
   try { body = await req.json(); } catch { /* empty body is fine */ }
@@ -1089,8 +1327,8 @@ Deno.serve(async (req: Request) => {
   const to = isDate(body.to) ? body.to : (isDate(body.from) ? body.from : istYesterday());
   if (from > to) return j({ error: "`from` is after `to`" }, 400);
   if (to > istToday()) return j({ error: "`to` is in the future" }, 400);
-  // One round of CONCURRENCY per invocation: two API calls per recording, so a small batch keeps each
-  // invocation well inside its wall clock.
+  // Processed one at a time now (CONCURRENCY=1), so a small batch keeps each invocation well inside
+  // its wall clock; promoteRetries recovers anything still stuck "processing" if it doesn't.
   const limit = Math.min(Math.max(Number(body.limit) || 3, 1), 24);
   /* Optional per-request models, so a new id can be proved on one call before it becomes the default
      for every call. Restricted to the shape of a model name so a request cannot point the URL
@@ -1098,8 +1336,9 @@ Deno.serve(async (req: Request) => {
   const reqStt = String(body.stt_model || body.model || "").trim();
   if (reqStt && !/^[a-zA-Z0-9._-]{3,60}$/.test(reqStt)) return j({ error: "that does not look like a model name" }, 400);
   const sttModel = reqStt || STT_MODEL;
-  /* Which engine does the LISTENING. ChatGPT by default; "gemini" is here so the two can be run over
-     the same recordings and compared rather than argued about. The judging is gpt-4o either way. */
+  /* Which engine runs BOTH stages - ChatGPT (gpt-4o-transcribe ear, gpt-4o judge) by default, or
+     Gemini (Files API + gemini-2.5-pro) for both, so a comparison run is a clean A/B rather than a
+     mix of one vendor's ear with the other's judge. */
   const engine = String(body.engine || "chatgpt").trim().toLowerCase() === "gemini" ? "gemini" : "chatgpt";
   const reqGemini = String(body.gemini_model || "").trim();
   if (reqGemini && !/^[a-zA-Z0-9._-]{3,60}$/.test(reqGemini)) return j({ error: "that does not look like a model name" }, 400);
@@ -1107,7 +1346,11 @@ Deno.serve(async (req: Request) => {
   const reqAnalysis = String(body.analysis_model || "").trim();
   if (reqAnalysis && !/^[a-zA-Z0-9._-]{3,60}$/.test(reqAnalysis)) return j({ error: "that does not look like a model name" }, 400);
   const analysisModel = reqAnalysis || ANALYSIS_MODEL;
+  const reqGeminiAnalysis = String(body.gemini_analysis_model || "").trim();
+  if (reqGeminiAnalysis && !/^[a-zA-Z0-9._-]{3,60}$/.test(reqGeminiAnalysis)) return j({ error: "that does not look like a model name" }, 400);
+  const geminiAnalysisModel = reqGeminiAnalysis || GEMINI_ANALYSIS_MODEL;
   if (engine === "gemini" && !GEMINI_KEY) return j({ error: "GEMINI_API_KEY not configured in Secrets" }, 500);
+  if (engine === "chatgpt" && !OPENAI_KEY) return j({ error: "CHATGPT_API_KEY not configured in Secrets" }, 500);
 
   try {
     if (action === "status") {
@@ -1121,7 +1364,8 @@ Deno.serve(async (req: Request) => {
       const { data: last } = await db.schema("acc").from("lost_call_sync_runs")
         .select("*").order("created_at", { ascending: false }).limit(1).maybeSingle();
       return j({ ok: true, counts, last_run: last || null,
-                 transcriber: STT_MODEL, gemini: GEMINI_MODEL, analyst: ANALYSIS_MODEL });
+                 transcriber: STT_MODEL, gemini: GEMINI_MODEL, analyst: ANALYSIS_MODEL,
+                 gemini_analyst: GEMINI_ANALYSIS_MODEL });
     }
     if (action === "retry") {
       const id = Number(body.id);
@@ -1137,20 +1381,20 @@ Deno.serve(async (req: Request) => {
         .eq("id", id).not("recording_url", "is", null).select("id, status").maybeSingle();
       if (error) return j({ error: error.message }, 500);
       if (!data) return j({ error: "no such call, or it has no recording URL to retry" }, 404);
-      return j({ ok: true, requeued: id, work: await doWork(db, 1, OPENAI_KEY, sttModel, analysisModel, engine, GEMINI_KEY, geminiModel) });
+      return j({ ok: true, requeued: id, work: await doWork(db, 1, OPENAI_KEY, sttModel, analysisModel, engine, GEMINI_KEY, geminiModel, geminiAnalysisModel) });
     }
     if (action === "pull") {
       const pulled = await doPull(db, from, to, trigger);
       return pulled instanceof Response ? pulled : j({ ok: true, action, ...pulled });
     }
     if (action === "work") {
-      const worked = await doWork(db, limit, OPENAI_KEY, sttModel, analysisModel, engine, GEMINI_KEY, geminiModel);
+      const worked = await doWork(db, limit, OPENAI_KEY, sttModel, analysisModel, engine, GEMINI_KEY, geminiModel, geminiAnalysisModel);
       return worked instanceof Response ? worked : j({ ok: true, action, ...worked });
     }
     if (action === "run") {
       const pulled = await doPull(db, from, to, trigger);
       if (pulled instanceof Response) return pulled;
-      const worked = await doWork(db, limit, OPENAI_KEY, sttModel, analysisModel, engine, GEMINI_KEY, geminiModel);
+      const worked = await doWork(db, limit, OPENAI_KEY, sttModel, analysisModel, engine, GEMINI_KEY, geminiModel, geminiAnalysisModel);
       return worked instanceof Response ? worked : j({ ok: true, action, pull: pulled, work: worked });
     }
     return j({ error: `unknown action "${action}"` }, 400);

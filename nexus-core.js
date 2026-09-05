@@ -14452,19 +14452,38 @@ function trcRowDate(r){
   return r.call_date || (r.communication_time?String(r.communication_time).slice(0,10):null);
 }
 
-/* A lead whose most recent call (by trcChrono, over its COMPLETE history - not just the rows a date
-   filter would leave) was not handled by Pre-Sales is dropped in full, including any older call of
-   its own that was individually Pre-Sales - crm_build_queue applies the identical lead-level gate
-   server-side, so a lead neither of them queues or lists here once it has moved on from pre-sales. */
-function trcLeadLastIsPresales(all){
-  const last={};
-  (all||[]).forEach(function(r){
-    const k=String(r.lead_id);
-    if(!last[k]||trcChrono(last[k],r)<0)last[k]=r;
+/* Mirrors crm_build_queue's lead-level gate exactly, including its fix: a call is dropped only when
+   the LEAD'S OWN LAST CALL FROM AN EARLIER DAY was confirmed Sales - never by a Sales call landing on
+   the very same day. Using each row's overall latest-ever call (the earlier version of this function)
+   broke exactly the case that gate exists for: a lead called by Pre-Sales at 10:00 and by Sales at
+   15:00 on the same day has its true latest-ever call be Sales, which hid the 10:00 call too, even
+   though the queue rightly transcribes it. So the state a row is judged against is built day by day,
+   in order, taking one call's team as a day's setting only once every row from that day has been
+   folded in - a same-day row is never compared against itself. */
+function trcLeadRowGate(all){
+  const byLead={};
+  (all||[]).forEach(function(r){(byLead[String(r.lead_id)]=byLead[String(r.lead_id)]||[]).push(r);});
+  const hide={};
+  Object.keys(byLead).forEach(function(k){
+    const list=byLead[k].slice().sort(trcChrono);
+    const groups=[];
+    list.forEach(function(r){
+      const d=trcRowDate(r);
+      const team=String(r.personnel_team||'')||null;
+      const g=groups.length?groups[groups.length-1]:null;
+      if(g&&g.date===d)g.team=team;
+      else groups.push({date:d,team:team});
+    });
+    list.forEach(function(r){
+      const d=trcRowDate(r);
+      let priorTeam=null;
+      for(let i=groups.length-1;i>=0;i--){
+        if(groups[i].date<d){priorTeam=groups[i].team;break;}
+      }
+      if(priorTeam==='Sales')hide[String(r.follow_up_id)]=true;
+    });
   });
-  const ok={};
-  Object.keys(last).forEach(function(k){ok[k]=String(last[k].personnel_team||'')==='Pre-Sales';});
-  return ok;
+  return hide;
 }
 
 /* Every filter, applied together. skipCards lifts the two card filters so the four totals stay put
@@ -14472,9 +14491,9 @@ function trcLeadLastIsPresales(all){
 function trcApply(rows,skipCards){
   const q=String(TRC_F.q||'').trim().toLowerCase();
   const all=rows||[];
-  const leadOk=trcLeadLastIsPresales(all);
+  const hideByFollowup=trcLeadRowGate(all);
   return all.filter(function(r){
-    if(!leadOk[String(r.lead_id)])return false;
+    if(hideByFollowup[String(r.follow_up_id)])return false;
     const d=trcRowDate(r);
     if(TRC_F.from&&(!d||d<TRC_F.from))return false;
     if(TRC_F.to&&(!d||d>TRC_F.to))return false;

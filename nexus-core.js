@@ -14417,6 +14417,9 @@ function trcWall(v, withTime){
    Previous day - the day whose calls actually finished processing overnight - rather than All time,
    so opening the page does not mean scrolling past months of history first. ---- */
 let TRC_ROWS=null;
+/* Which window TRC_ROWS was actually fetched for ('from|to', '' meaning All time) - so a filter
+   change knows whether the cache still answers it or a fresh, still-scoped fetch is needed. */
+let TRC_ROWS_RANGE=null;
 const TRC_F={from:traYesterday(),to:traYesterday(),proc:'all',match:'all',crm:'all',bu:'all',q:'',mismatch:'all',personnel:'all'};
 /* The lead (and, when the click came from the call-level Mismatch table, the exact follow-up) most
    recently opened from this list, so coming back from its detail page (the in-app Back button, or
@@ -14449,25 +14452,59 @@ function trcIsRegression(r){
 
 /* The list never asks for transcripts. A day of calls is a few hundred rows and every one of them
    carries its full turn-by-turn transcript plus five QA blobs - fetching those to render a table of
-   names is megabytes for nothing. The detail view asks for `*` on one lead. */
+   names is megabytes for nothing. The detail view asks for `*` on one lead.
+
+   IT ALSO USED TO ASK FOR EVERY FOLLOW-UP EVER SEEN, every time this page opened, regardless of the
+   date filter on screen - the whole point was that changing the filter afterwards could stay client
+   side and instant. That table only grows (nothing is ever pruned, by design), so the page got
+   slower to open every day whether or not anyone was looking at more than yesterday.
+
+   The default view - and the common one - is a single day. So when a date range is actually set,
+   fetch is now two steps: first the (small, indexed) set of leads with a call in that window, then
+   every row for exactly those leads - full history, not windowed, because trcLeadRowGate below has
+   to judge each row against what the lead's OWN earlier days were, and a lead's history does not
+   stop at the window's edge. Cost now scales with a day's leads, not with the lifetime table.
+   "All time" (both dates cleared) still does the original full fetch - that is a real request for
+   everything, not the default. */
 async function trcFetch(force){
-  if(TRC_ROWS&&!force)return TRC_ROWS;
+  const rangeKey=(TRC_F.from||'')+'|'+(TRC_F.to||'');
+  if(TRC_ROWS&&!force&&TRC_ROWS_RANGE===rangeKey)return TRC_ROWS;
   const PAGE=1000;let out=[],from=0;
   try{
+    let leadIds=null;
+    if(TRC_F.from||TRC_F.to){
+      const leadSet=new Set();
+      for(let lf=0;;lf+=PAGE){
+        let lq=sb.schema('acc').from('crm_followups').select('lead_id').range(lf,lf+PAGE-1);
+        if(TRC_F.from)lq=lq.gte('call_date',TRC_F.from);
+        if(TRC_F.to)lq=lq.lte('call_date',TRC_F.to);
+        const {data:leadRows,error:leadErr}=await lq;
+        if(leadErr)throw leadErr;
+        (leadRows||[]).forEach(function(r){leadSet.add(r.lead_id);});
+        if(!leadRows||leadRows.length<PAGE)break;
+      }
+      leadIds=Array.from(leadSet);
+      if(!leadIds.length){TRC_ROWS=[];TRC_ROWS_RANGE=rangeKey;return TRC_ROWS;}
+      // A custom range wide enough to touch this many leads is close to the whole table anyway -
+      // an .in() list that long risks the request URL itself, so just fetch everything instead.
+      if(leadIds.length>800)leadIds=null;
+    }
     for(;;){
-      const {data,error}=await sb.schema('acc').from('followup_timeline_v').select(TRC_LIGHT)
+      let q=sb.schema('acc').from('followup_timeline_v').select(TRC_LIGHT)
         .order('call_date',{ascending:false,nullsFirst:false})
         .order('communication_time',{ascending:false,nullsFirst:false})
         .order('follow_up_id',{ascending:false})
         .range(from,from+PAGE-1);
+      if(leadIds)q=q.in('lead_id',leadIds);
+      const {data,error}=await q;
       if(error)throw error;
       const batch=data||[];out=out.concat(batch);
       if(batch.length<PAGE)break;
       from+=PAGE;if(from>50000)break;
     }
-    TRC_ROWS=out;
+    TRC_ROWS=out;TRC_ROWS_RANGE=rangeKey;
   }catch(e){
-    TRC_ROWS=out.length?out:[];
+    TRC_ROWS=out.length?out:[];TRC_ROWS_RANGE=null;
     toast('Could not load the call history: '+((e&&e.message)||e),'err');
   }
   return TRC_ROWS;
@@ -14695,7 +14732,11 @@ function trcDateBar(){
     +'<input type="date" id="trcTo" value="'+esc(TRC_F.to||'')+'" onchange="trcSetRange((document.getElementById(\'trcFrom\').value||this.value||null),this.value||null)" style="padding:5px 8px">'
   +'</div>';
 }
-window.trcSetRange=function(f,t){TRC_F.from=f||null;TRC_F.to=t||null;trcRender(true);};
+window.trcSetRange=async function(f,t){
+  TRC_F.from=f||null;TRC_F.to=t||null;
+  const b=$('trcRows');if(b)b.innerHTML='<tr><td colspan="11"><div class="loader"><div class="spin"></div></div></td></tr>';
+  await trcFetch(false);trcRender(true);
+};
 
 function trcFilterBar(all){
   const crmValues=Array.from(new Set((all||[]).map(function(r){return r.crm_status;})
@@ -14738,10 +14779,12 @@ window.trcSet=function(k,v){
   // The search box must not lose focus on every keystroke, so text filtering repaints the table only.
   trcRender(k!=='q');
 };
-window.trcClear=function(){
+window.trcClear=async function(){
   TRC_F.proc='all';TRC_F.match='all';TRC_F.crm='all';TRC_F.bu='all';TRC_F.mismatch='all';
   TRC_F.personnel='all';
-  TRC_F.q='';TRC_F.from=null;TRC_F.to=null;trcRender(true);
+  TRC_F.q='';TRC_F.from=null;TRC_F.to=null;
+  const b=$('trcRows');if(b)b.innerHTML='<tr><td colspan="11"><div class="loader"><div class="spin"></div></div></td></tr>';
+  await trcFetch(false);trcRender(true);
 };
 window.trcRefresh=async function(){await trcFetch(true);trcRender(true);};
 

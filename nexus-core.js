@@ -14459,43 +14459,27 @@ function trcIsRegression(r){
    side and instant. That table only grows (nothing is ever pruned, by design), so the page got
    slower to open every day whether or not anyone was looking at more than yesterday.
 
-   The default view - and the common one - is a single day. So when a date range is actually set,
-   fetch is now two steps: first the (small, indexed) set of leads with a call in that window, then
-   every row for exactly those leads - full history, not windowed, because trcLeadRowGate below has
-   to judge each row against what the lead's OWN earlier days were, and a lead's history does not
-   stop at the window's edge. Cost now scales with a day's leads, not with the lifetime table.
-   "All time" (both dates cleared) still does the original full fetch - that is a real request for
+   A later revision widened this to fetch each windowed lead's FULL history (not just the window),
+   because trcLeadRowGate judged a row against the lead's own earlier days. That gate is gone - the
+   business rule is now decided by the decision date alone, never by an earlier day - and nothing else
+   here reads a lead's history outside the window (the lead detail page runs its own dedicated query
+   for one lead_id). So this goes back to a single, directly date-filtered fetch: cost scales with the
+   window's own row count, not with any lead's lifetime history.
+   "All time" (both dates cleared) does the original full fetch - that is a real request for
    everything, not the default. */
 async function trcFetch(force){
   const rangeKey=(TRC_F.from||'')+'|'+(TRC_F.to||'');
   if(TRC_ROWS&&!force&&TRC_ROWS_RANGE===rangeKey)return TRC_ROWS;
   const PAGE=1000;let out=[],from=0;
   try{
-    let leadIds=null;
-    if(TRC_F.from||TRC_F.to){
-      const leadSet=new Set();
-      for(let lf=0;;lf+=PAGE){
-        let lq=sb.schema('acc').from('crm_followups').select('lead_id').range(lf,lf+PAGE-1);
-        if(TRC_F.from)lq=lq.gte('call_date',TRC_F.from);
-        if(TRC_F.to)lq=lq.lte('call_date',TRC_F.to);
-        const {data:leadRows,error:leadErr}=await lq;
-        if(leadErr)throw leadErr;
-        (leadRows||[]).forEach(function(r){leadSet.add(r.lead_id);});
-        if(!leadRows||leadRows.length<PAGE)break;
-      }
-      leadIds=Array.from(leadSet);
-      if(!leadIds.length){TRC_ROWS=[];TRC_ROWS_RANGE=rangeKey;return TRC_ROWS;}
-      // A custom range wide enough to touch this many leads is close to the whole table anyway -
-      // an .in() list that long risks the request URL itself, so just fetch everything instead.
-      if(leadIds.length>800)leadIds=null;
-    }
     for(;;){
       let q=sb.schema('acc').from('followup_timeline_v').select(TRC_LIGHT)
         .order('call_date',{ascending:false,nullsFirst:false})
         .order('communication_time',{ascending:false,nullsFirst:false})
         .order('follow_up_id',{ascending:false})
         .range(from,from+PAGE-1);
-      if(leadIds)q=q.in('lead_id',leadIds);
+      if(TRC_F.from)q=q.gte('call_date',TRC_F.from);
+      if(TRC_F.to)q=q.lte('call_date',TRC_F.to);
       const {data,error}=await q;
       if(error)throw error;
       const batch=data||[];out=out.concat(batch);
@@ -14514,48 +14498,18 @@ function trcRowDate(r){
   return r.call_date || (r.communication_time?String(r.communication_time).slice(0,10):null);
 }
 
-/* Mirrors crm_build_queue's lead-level gate exactly, including its fix: a call is dropped only when
-   the LEAD'S OWN LAST CALL FROM AN EARLIER DAY was confirmed Sales - never by a Sales call landing on
-   the very same day. Using each row's overall latest-ever call (the earlier version of this function)
-   broke exactly the case that gate exists for: a lead called by Pre-Sales at 10:00 and by Sales at
-   15:00 on the same day has its true latest-ever call be Sales, which hid the 10:00 call too, even
-   though the queue rightly transcribes it. So the state a row is judged against is built day by day,
-   in order, taking one call's team as a day's setting only once every row from that day has been
-   folded in - a same-day row is never compared against itself. */
-function trcLeadRowGate(all){
-  const byLead={};
-  (all||[]).forEach(function(r){(byLead[String(r.lead_id)]=byLead[String(r.lead_id)]||[]).push(r);});
-  const hide={};
-  Object.keys(byLead).forEach(function(k){
-    const list=byLead[k].slice().sort(trcChrono);
-    const groups=[];
-    list.forEach(function(r){
-      const d=trcRowDate(r);
-      const team=String(r.personnel_team||'')||null;
-      const g=groups.length?groups[groups.length-1]:null;
-      if(g&&g.date===d)g.team=team;
-      else groups.push({date:d,team:team});
-    });
-    list.forEach(function(r){
-      const d=trcRowDate(r);
-      let priorTeam=null;
-      for(let i=groups.length-1;i>=0;i--){
-        if(groups[i].date<d){priorTeam=groups[i].team;break;}
-      }
-      if(priorTeam==='Sales')hide[String(r.follow_up_id)]=true;
-    });
-  });
-  return hide;
-}
+/* There used to be a lead-level gate here mirroring crm_build_queue's: a call was dropped whenever the
+   LEAD'S OWN LAST CALL FROM AN EARLIER DAY was confirmed Sales, even a call that was itself Pre-Sales.
+   That rule is gone from crm_build_queue - eligibility is decided by the decision date alone, never by
+   an earlier day - so this side dropped the matching gate too, to keep the queue and the screen from
+   disagreeing. Nothing here still needs a lead's history beyond the selected window (see trcFetch). */
 
 /* Every filter, applied together. skipCards lifts the two card filters so the four totals stay put
    while one of them is selected - clicking Mismatch must not collapse Transcribed to the mismatches. */
 function trcApply(rows,skipCards){
   const q=String(TRC_F.q||'').trim().toLowerCase();
   const all=rows||[];
-  const hideByFollowup=trcLeadRowGate(all);
   return all.filter(function(r){
-    if(hideByFollowup[String(r.follow_up_id)])return false;
     const d=trcRowDate(r);
     if(TRC_F.from&&(!d||d<TRC_F.from))return false;
     if(TRC_F.to&&(!d||d>TRC_F.to))return false;

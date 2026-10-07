@@ -413,7 +413,7 @@ const LABELS={};const ICONS={};NAV.forEach(g=>g.items.forEach(i=>{LABELS[i.id]=i
 const MODLIST=[];NAV.forEach(g=>g.items.forEach(i=>MODLIST.push([i.id,i.label])));
 const MODSET=new Set(MODLIST.map(m=>m[0]));
 const LEVELS=['Manager','Employee','New','Intern'];
-const DEFAULT_MODULES=['dashboard','tasks','projects','settings','network'];
+const DEFAULT_MODULES=['dashboard','tasks','projects','settings','network','scheduling'];
 function navIcon(id){return ICONS[id]||'fa-square';}
 function allowedSet(){if(state.super)return null;const m=state.roles&&state.roles.modules;if(m===null||m===undefined)return new Set(DEFAULT_MODULES);if(Array.isArray(m)&&m.length){const ss=new Set(m);ss.add('dashboard');ss.add('settings');ss.add('network');return ss;}const ss=new Set(['dashboard','settings','network']);return ss;}
 /* Usability sits under Control Panel in Administration, but unlike Control Panel it is NOT
